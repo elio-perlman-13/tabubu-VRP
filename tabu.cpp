@@ -10,6 +10,7 @@
 #define mp make_pair
 #define pii pair<int,int>
 #define vi vector<int>
+#define vd vector<double>
 #define vvi vector<vector<int>>
 #define vpi vector<pair<int,int>>
 #define all(v) v.begin(),v.end()
@@ -25,13 +26,13 @@ vi demand; // demand[i]: demand of customer i
 vi Qk; // Qk[k]: capacity of vehicle k
 vi Dk; // Dk[k]: max duration of vehicle k
 vi ei, li; // ei[i], li[i]: time window for customer i
-vector<double> di; // di[i]: service duration at customer i
+vd di; // di[i]: service duration at customer i
 int eo, lo; // time window for depot
 vpi loc; // loc[i]: location (x, y) of customer i
 vvi routes; // routes[k]: sequence of customer indices for vehicle k (start/end with depot)
 vi load; // load[k]: current load of vehicle k
-vi duration; // duration[k]: current duration of vehicle k
-vi arrival_time; // arrival_time[i]: arrival time at customer i
+vd duration; // duration[k]: current duration of vehicle k
+vd arrival_time; // arrival_time[i]: arrival time at customer i
 vvi tabu_list; // for Tabu Search memory
 double best_cost; // best total travel time found
 vector<pair<double, int>> angle_customer; // (angle, customer index)
@@ -39,8 +40,8 @@ vector<pair<double, int>> angle_customer; // (angle, customer index)
 struct Solution {
     vvi routes; // routes for each vehicle
     vi load;           // load for each vehicle
-    vi duration;       // duration for each vehicle
-    vi arrival_time;   // arrival time at each customer
+    vd duration;       // duration for each vehicle
+    vd arrival_time;   // arrival time at each customer
     double total_cost; // total travel time/distance
 };
 
@@ -51,7 +52,7 @@ double euclidean(int x1, int y1, int x2, int y2) {
 
 // Build distance matrix: dist[i][j] = Euclidean distance from i to j
 void build_distance_matrix() {
-    dist.assign(n+5, vector<double>(n+5, 0.0));
+    dist.assign(n+5, vd(n+5, 0.0));
     for (int i = 0; i <= n; ++i) {
         for (int j = 0; j <= n; ++j) {
             if (i == j) {
@@ -81,71 +82,83 @@ Solution generate_initial_solution() {
     int start_idx = dis(gen);
 
     // 3. Build sequence
-    vector<int> seq;
+    vi seq;
     for (int i = 0; i < n; ++i)
         seq.push_back(angle_customer[(start_idx + i) % n].second);
 
     // 4. Construct routes
-    routes.assign(m+1, vector<int>());
+    routes.assign(m+1, vi());
     load.assign(m+1, 0);
     duration.assign(m+1, 0);
     int k = 1;
     for (int idx : seq) {
         // Try to insert idx into route k at best position
-        int best_pos = -1, best_incr = INT_MAX;
+        int best_feas_pos = -1, best_feas_incr = INT_MAX;
+        int best_infeas_pos = -1;
+        double best_infeas_incr = 1e18;
         if (routes[k].empty()) {
             routes[k].push_back(0);
             routes[k].push_back(0);
         } // start and end at depot
+        int new_load = load[k] + demand[idx];
         for (int pos = 1; pos < routes[k].size(); ++pos) {
+            if (new_load > Qk[k]) break;
             // Try inserting at pos
-            int jl = routes[k][pos-1];
-            int j2 = routes[k][pos];
-            if ((ei[jl] < ei[idx] && ei[idx] < ei[j2] && j2 != 0) || j2 == 0) {
+            int prev = routes[k][pos-1];
+            int next = routes[k][pos];
+            if ((ei[prev] < ei[idx] && ei[idx] < ei[next] && next != 0) || next == 0) {
                 auto temp = routes[k];
                 temp.insert(temp.begin() + pos, idx);
-                // Compute new load and duration
-                int new_load = load[k] + demand[idx];
-                double new_dur = 0;
-                for (int p = 1; p < temp.size(); ++p){
-                    new_dur += di[temp[p]];
-                    new_dur += dist[temp[p-1]][temp[p]];
-                }
-                // Check constraints
+                // Compute new load and incremental duration
+                // Remove old segment, add new segments
+                double delta = dist[prev][idx] + di[idx] + dist[idx][next] - dist[prev][next];
+                double new_dur = duration[k] + delta;
+                double incr = delta;
                 if (new_load <= Qk[k] && new_dur <= Dk[k]) {
-                    int incr = new_dur - duration[k];
-                    if (incr < best_incr) {
-                        best_incr = incr;
-                        best_pos = pos;
+                    if (incr < best_feas_incr) {
+                        best_feas_incr = incr;
+                        best_feas_pos = pos;
+                    }
+                } else {
+                    if (incr < best_infeas_incr) {
+                        best_infeas_incr = incr;
+                        best_infeas_pos = pos;
                     }
                 }
             }
         }
-        // Insert at best position if found
-        if (best_pos != -1) {
-            routes[k].insert(routes[k].begin() + best_pos, idx);
+        // Insert at best feasible position if found
+        if (best_feas_pos != -1) {
+            routes[k].insert(routes[k].begin() + best_feas_pos, idx);
             load[k] += demand[idx];
             // Recompute duration
             duration[k] = 0;
             for (int p = 1; p < routes[k].size(); ++p)
                 duration[k] += dist[routes[k][p-1]][routes[k][p]];
         }
-        //cout routes for debug prints
-        for (int i = 0; i < routes[k].size(); i++){
-            cout << routes[k][i] << " ";
-        }
-        cout << endl;
         // If constraints violated, move to next route
-        if (best_pos == -1) {
-            k = min(k+1, m);
-            routes[k].clear();
-            routes[k].push_back(0);
-            routes[k].push_back(idx);
-            routes[k].push_back(0);
-            load[k] = demand[idx];
-            duration[k] = 0;
-            for (int p = 1; p < routes[k].size(); ++p)
-                duration[k] += dist[routes[k][p-1]][routes[k][p]];
+        if (best_feas_pos == -1) {
+            if (k < m) {
+                k++;
+                routes[k].clear();
+                routes[k].push_back(0);
+                routes[k].push_back(idx);
+                routes[k].push_back(0);
+                load[k] = demand[idx];
+                duration[k] = 0;
+                for (int p = 1; p < routes[k].size(); ++p)
+                    duration[k] += dist[routes[k][p-1]][routes[k][p]];
+            } else {
+                // Insert idx into route m (k==m) at the best infeasible position found above
+                if (best_infeas_pos == -1) best_infeas_pos = 1;
+                routes[m].insert(routes[m].begin() + best_infeas_pos, idx);
+                load[m] += demand[idx];
+                duration[m] = 0;
+                for (int p = 1; p < routes[m].size(); ++p) {
+                    duration[m] += di[routes[m][p]];
+                    duration[m] += dist[routes[m][p-1]][routes[m][p]];
+                }
+            }
         }
     }
     // End each route at depot
@@ -156,6 +169,26 @@ Solution generate_initial_solution() {
     sol.routes = routes;
     sol.load = load;
     sol.duration = duration;
+
+    // Calculate arrival times for each customer in each route
+    sol.arrival_time.assign(n+1, 0.0);
+    for (int k = 1; k <= m; ++k) {
+        double t = 0;
+        for (int p = 1; p < routes[k].size(); ++p) {
+            int prev = routes[k][p-1];
+            int curr = routes[k][p];
+            t += dist[prev][curr];
+            if (curr != 0) {
+                sol.arrival_time[curr] = max((double)ei[curr], t);
+                t = sol.arrival_time[curr] + di[curr];
+            }
+        }
+    }
+
+    sol.total_cost = 0;
+    for (int k = 1; k <= m; ++k) {
+        sol.total_cost += duration[k];
+    }
     return sol;
 }
 
@@ -170,6 +203,13 @@ void tabu_search(){
 void output(){
     Solution sol;
     sol = generate_initial_solution();
+    //Print the distance matrix:
+    for (int i = 0; i <= n; ++i) {
+        for (int j = 0; j <= n; ++j) {
+            cout << dist[i][j] << " ";
+        }
+        cout << endl;
+    }
     //Print the solution:
     for (int k = 1; k <= m; ++k) {
         cout << "Route " << k << ": ";
@@ -177,7 +217,13 @@ void output(){
             cout << idx << " ";
         }
         cout << endl;
+        cout << "Load: " << sol.load[k] << ", Duration: " << sol.duration[k] << endl;
     }
+    cout << "Arrival Times: ";
+    for (int i = 1; i <= n; ++i) {
+            cout << sol.arrival_time[i] << " ";
+    }
+    cout << endl;
 }
 
 void input(){
@@ -211,7 +257,7 @@ void input(){
 
 int main(){
     freopen("input.txt", "r", stdin);
-//    freopen("output.txt", "w", stdout);
+    freopen("output.txt", "w", stdout);
     input();
     init();
     tabu_search();
