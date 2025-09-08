@@ -40,7 +40,7 @@ vvi closest_neighbors; // closest_neighbors[i]: list of closest neighbors to cus
 vvi freq; // freq[k][i]: how many times customer i inserted into route k for diversification
 
 const int MAX_ITER = 20000; // max iterations for Tabu Search
-const double lambda = 10.0; // scaling factor for frequency penalty (tune as needed)
+const double lambda = 0.01; // scaling factor for frequency penalty (tune as needed)
 const int nmax = 500; // for early stopping if no improvement
 
 struct Solution {
@@ -307,7 +307,6 @@ Solution best_neighbor(const Solution& sol, int i, int current_iter, int from_ro
         geni_positions.insert(1);
         geni_positions.insert((int)sol.routes[k].size() - 1);
         for (int pos : geni_positions) {
-            cout << "Trying to insert customer " << i << " into route " << k << " at position " << pos << endl;
             if (pos < 1 || pos >= (int)sol.routes[k].size()) continue;
             Solution cand = sol;
             // Remove i from all routes to prevent duplication
@@ -328,7 +327,18 @@ Solution best_neighbor(const Solution& sol, int i, int current_iter, int from_ro
             }
             r2.insert(r2.begin() + insert_pos, i);
             cand.load[k] += demand[i];
-            // Update duration for route k only (since i is only in k now)
+            // Update durations and arrival times for both affected routes
+            // First, find which route i was removed from (other than k)
+            int src_route = -1;
+            for (int r = 1; r <= m; ++r) {
+                if (r == k) continue;
+                auto it = std::find(sol.routes[r].begin(), sol.routes[r].end(), i);
+                if (it != sol.routes[r].end()) {
+                    src_route = r;
+                    break;
+                }
+            }
+            // Update duration for destination route k
             double delta_k = 0.0;
             int new_pos = insert_pos;
             int prev = r2[new_pos - 1];
@@ -336,7 +346,17 @@ Solution best_neighbor(const Solution& sol, int i, int current_iter, int from_ro
             delta_k += dist[prev][i] + di[i] + dist[i][next];
             delta_k -= dist[prev][next];
             cand.duration[k] += delta_k;
-            // Efficiently update arrival times for route k only
+            // Recompute duration for src_route (from which i was removed), if any
+            if (src_route != -1) {
+                double dur = 0.0;
+                auto& rsrc = cand.routes[src_route];
+                for (int p = 1; p < (int)rsrc.size(); ++p) {
+                    dur += dist[rsrc[p-1]][rsrc[p]];
+                }
+                cand.duration[src_route] = dur;
+            }
+            // Efficiently update arrival times for both routes
+            // For k (destination route)
             if (!cand.routes[k].empty()) cand.arrival_time[cand.routes[k][0]] = 0.0;
             double tt = 0.0;
             for (int p = 1; p < (int)cand.routes[k].size(); ++p) {
@@ -346,6 +366,20 @@ Solution best_neighbor(const Solution& sol, int i, int current_iter, int from_ro
                 if (curr != 0) {
                     cand.arrival_time[curr] = max((double)ei[curr], tt);
                     tt = cand.arrival_time[curr] + di[curr];
+                }
+            }
+            // For src_route (if any)
+            if (src_route != -1 && !cand.routes[src_route].empty()) {
+                cand.arrival_time[cand.routes[src_route][0]] = 0.0;
+                double tts = 0.0;
+                for (int p = 1; p < (int)cand.routes[src_route].size(); ++p) {
+                    int prev = cand.routes[src_route][p-1];
+                    int curr = cand.routes[src_route][p];
+                    tts += dist[prev][curr];
+                    if (curr != 0) {
+                        cand.arrival_time[curr] = max((double)ei[curr], tts);
+                        tts = cand.arrival_time[curr] + di[curr];
+                    }
                 }
             }
             // Recompute total cost
@@ -358,19 +392,18 @@ Solution best_neighbor(const Solution& sol, int i, int current_iter, int from_ro
             // Tabu check: skip if tabu unless aspiration (improves best_cost)
             bool is_tabu = (tabu_list[k][i] > current_iter);
             if (is_tabu && (f2 >= best_f2 && f2 > cand.total_cost || cand.total_cost >= best_cost && f2 == cand.total_cost)){
-                cout << "Move is tabu, skipping." << endl;
+                // ...removed debug cout...
                 continue;
             }
             // Frequency penalty for diversification (only for non-improving moves)
-            double penalized_f2 = 0.0;
+            double freq_penalty = 0.0;
             if (f2 > best_f2){
                 for (int r = 1; r <= n; ++r) {
-                    penalized_f2 += freq[cand.customer_vehicle[r]][r];
+                    freq_penalty += freq[cand.customer_vehicle[r]][r];
                 }
-                penalized_f2 *= lambda * sqrt(n * m) * cand.total_cost;
+                freq_penalty *= lambda * sqrt(n * m) * cand.total_cost;
             }
-            print_solution(cand);
-            penalized_f2 = f2 + penalized_f2;
+            double penalized_f2 = f2 + freq_penalty;
             if (penalized_f2 < best_neighbor_cost) {
                 best_neighbor_cost = penalized_f2;
                 best_sol = cand;
@@ -388,9 +421,8 @@ void post_optimize_route(vector<int>& route, vector<double>& arrival_time, int k
     // route: route[k], arrival_time: arrival_time for route k, k: vehicle index
 }
 
-Solution tabu_search(Solution sol, double theta = 0.05, double p1=0.2*n, double p2=0.2*n) {
-    cout << "Starting Tabu Search with theta=" << theta << ", p1=" << p1 << ", p2=" << p2 << endl;
-    print_solution(sol);
+Solution tabu_search(Solution sol, double delta = 0, double p1=0.2*n, double p2=0.2*n) {
+    // ...removed debug cout...
     // Evaluate all possible moves: move customer i from route k to route k', insert at best position
     double best_f2 = 1e18;
     double best_cost = 1e18;
@@ -398,7 +430,7 @@ Solution tabu_search(Solution sol, double theta = 0.05, double p1=0.2*n, double 
     Solution current_sol = sol;
     int current_iter = 0;
     int tabu_min = 5, tabu_max = 10;
-    double alpha = 1.0, beta = 1.0, gamma = 1.0;
+    double alpha = 1, beta = 1, gamma = 1;
     // Initialize frequency matrix
     freq.assign(m+1, vector<int>(n+1, 0));
     double current_f2 = F2(current_sol, alpha, beta, gamma);
@@ -408,28 +440,58 @@ Solution tabu_search(Solution sol, double theta = 0.05, double p1=0.2*n, double 
     best_f2 = current_f2;
     int no_improve_iters = 0;
     double last_best_f2 = best_f2, last_best_cost = best_cost;
+
+    // Open file to log f2 and total_cost per iteration
+    static int log_counter = 0;
+    std::ofstream log_file;
+    std::string log_filename = "tabu_log_" + std::to_string(log_counter++) + ".csv";
+    log_file.open(log_filename);
+    log_file << "iter,f2,total_cost\n";
     while (current_iter < MAX_ITER) {
-        random_device rd;
-        mt19937 gen(rd());
-        uniform_int_distribution<> dis(1, n);
-        int i = dis(gen);
-        int from_route = current_sol.customer_vehicle[i];
-        Solution neighbor = best_neighbor(current_sol, i, current_iter, from_route, alpha, beta, gamma, p1, p2, best_f2, best_cost);
-        double f2 = F2(neighbor, alpha, beta, gamma);
-        int to_route = neighbor.customer_vehicle[i];
+        Solution best_neighbor_sol = current_sol;
+        double best_neighbor_f2 = 1e18;
+        int best_i = -1, best_from_route = -1, best_to_route = -1;
+        // Loop over all customers to find the best neighbor
+        for (int i = 1; i <= n; ++i) {
+            int from_route = current_sol.customer_vehicle[i];
+            Solution neighbor = best_neighbor(current_sol, i, current_iter, from_route, alpha, beta, gamma, p1, p2, best_f2, best_cost);
+            double f2 = F2(neighbor, alpha, beta, gamma);
+            if (f2 < best_neighbor_f2) {
+                best_neighbor_f2 = f2;
+                best_neighbor_sol = neighbor;
+                best_i = i;
+                best_from_route = from_route;
+                best_to_route = neighbor.customer_vehicle[i];
+            }
+        }
+        // print the best move found
+        cout << "Iter " << current_iter << ": Move customer " << best_i << " from route " << best_from_route << " to route " << best_to_route << ", F2: " << best_neighbor_f2 << ", Cost: " << best_neighbor_sol.total_cost << endl;
+        // Print both penalized and unpenalized costs for clarity
+        double best_f2_val = F2(best_neighbor_sol, alpha, beta, gamma);
+        cout << "Best neighbor after moving customer " << best_i << ": penalized cost = " << best_neighbor_sol.total_cost
+            << ", f2 = " << best_f2_val
+            << ", total_cost = " << best_neighbor_sol.total_cost << endl;
+        cout << "alpha: " << alpha << ", beta: " << beta << ", gamma: " << gamma << endl;
         // If the customer was actually moved to a new route, set tabu tenure
-        if (from_route != to_route) {
+        if (best_from_route != best_to_route && best_i != -1) {
+            random_device rd;
+            mt19937 gen(rd());
             uniform_int_distribution<> tabu_dist(tabu_min, tabu_max);
             int theta = tabu_dist(gen);
-            tabu_list[from_route][i] = current_iter + theta;
+            tabu_list[best_from_route][best_i] = current_iter + theta;
         }
         // Update frequency for diversification
-        freq[to_route][i]++;
+        if (best_i != -1) freq[best_to_route][best_i]++;
         // update best solution found
-        if (f2 < best_f2 || (f2 == best_f2 && neighbor.total_cost < best_cost)) {
-            best_f2 = f2;
-            best_cost = neighbor.total_cost;
-            best_sol = neighbor;
+        if (best_neighbor_f2 < best_f2 || (best_neighbor_f2 == best_f2 && best_neighbor_sol.total_cost < best_cost)) {
+            best_f2 = best_neighbor_f2;
+            best_cost = best_neighbor_sol.total_cost;
+            best_sol = best_neighbor_sol;
+        }
+
+        if (best_neighbor_f2 < current_f2 || (best_neighbor_f2 == current_f2 && best_neighbor_sol.total_cost < current_sol.total_cost)) {
+            current_sol = best_neighbor_sol;
+            current_f2 = best_neighbor_f2;
         }
 
         // Early stopping: check if best_f2 and best_cost have improved
@@ -441,11 +503,8 @@ Solution tabu_search(Solution sol, double theta = 0.05, double p1=0.2*n, double 
             no_improve_iters++;
         }
         if (no_improve_iters >= nmax) {
-            cout << "No improvement for " << nmax << " iterations. Stopping early." << endl;
             break;
         }
-
-        current_sol = neighbor;
 
         // Adaptive penalty parameter update
         // Check feasibility for each constraint
@@ -459,29 +518,32 @@ Solution tabu_search(Solution sol, double theta = 0.05, double p1=0.2*n, double 
         }
         // Update alpha (load penalty)
         if (load_feas) {
-            alpha /= (1.0 + theta);
+            alpha /= (1.0 + delta);
         } else {
-            alpha *= (1.0 + theta);
+            alpha *= (1.0 + delta);
         }
         // Update beta (duration penalty)
         if (dur_feas) {
-            beta /= (1.0 + theta);
+            beta /= (1.0 + delta);
         } else {
-            beta *= (1.0 + theta);
+            beta *= (1.0 + delta);
         }
         // Update gamma (time window penalty)
         if (tw_feas) {
-            gamma /= (1.0 + theta);
+            gamma /= (1.0 + delta);
         } else {
-            gamma *= (1.0 + theta);
+            gamma *= (1.0 + delta);
         }
 
+        // Log best_f2 and best_cost for this iteration
+        log_file << current_iter << "," << best_f2 << "," << best_cost << "\n";
         ++current_iter;
     }
     // Post-optimization: apply TSPTW heuristic to each route of best_sol
     for (int k = 1; k <= m; ++k) {
         post_optimize_route(best_sol.routes[k], best_sol.arrival_time, k);
     }
+    log_file.close();
     return best_sol;
 }
 
@@ -508,42 +570,76 @@ void output(){
     }
     //Print the solution:
     print_solution(sol);
-    Solution step_1_sol = tabu_search(sol, 0.1, int(0.2*n), int(0.2*n));
-    Solution best_sol = tabu_search(step_1_sol, 0.05, int(0.1*n), int(0.1*n));
+    Solution step_1_sol = tabu_search(sol, 0.003, int(0.2*n), int(0.2*n));
+    Solution best_sol = tabu_search(step_1_sol, 0.006, int(0.1*n), int(0.1*n));
     print_solution(best_sol);
 }
 
 void input(){
-    cin >> n >> m;
-
-    demand.resize(n+5);
+    // Parse Solomon C101 format
+    string line;
+    // Skip first line (instance name)
+    getline(cin, line);
+    // Skip blank line
+    getline(cin, line);
+    // Skip VEHICLE
+    getline(cin, line);
+    // Skip NUMBER CAPACITY
+    getline(cin, line);
+    // Read vehicle count and capacity
+    int vehicle_count, vehicle_capacity;
+    cin >> vehicle_count >> vehicle_capacity;
+    m = vehicle_count;
     Qk.resize(m+5);
-    Dk.resize(m+5);
+    for (int i = 1; i <= m; ++i) Qk[i] = vehicle_capacity;
+    // Skip blank line
+    getline(cin, line);
+    getline(cin, line);
+    // Skip CUSTOMER
+    getline(cin, line);
+    // Skip header
+    getline(cin, line);
+    // Skip blank line
+    getline(cin, line);
+    // Read customer table
+    vector<tuple<int,int,int,int,int,int,int>> customers;
+    while (getline(cin, line)) {
+        if (line.empty()) continue;
+        istringstream iss(line);
+        int id, x, y, demand, ready, due, service;
+        if (!(iss >> id >> x >> y >> demand >> ready >> due >> service)) break;
+        customers.push_back({id, x, y, demand, ready, due, service});
+    }
+    n = customers.size() - 1; // depot is 0
+    demand.resize(n+5);
     di.resize(n+5);
     ei.resize(n+5);
     li.resize(n+5);
+    loc.clear();
+    for (auto& tup : customers) {
+        int id, x, y, dem, ready, due, service;
+        tie(id, x, y, dem, ready, due, service) = tup;
+        if (id == 0) {
+            eo = ready; lo = due;
+        }
+        demand[id] = dem;
+        di[id] = service;
+        ei[id] = ready;
+        li[id] = due;
+        loc.push_back(mp(x, y));
+    }
+    Dk.resize(m+5);
+    // Set max duration for each vehicle as depot's due date (lo)
+    for (int i = 1; i <= m; ++i) Dk[i] = lo;
     routes.resize(m+5);
     load.resize(m+5);
     duration.resize(m+5);
     arrival_time.resize(n+5);
     tabu_list.resize(m+5, vi(n+5, 0));
-
-    for(int i=1; i<=n; i++){
-        cin >> demand[i] >> ei[i] >> li[i] >> di[i];
-    }
-    cin >> eo >> lo;
-    for(int i=1; i<=m; i++){
-        cin >> Qk[i] >> Dk[i];
-    }
-    for (int i=0; i<=n; i++) {
-        int x, y;
-        cin >> x >> y;
-        loc.push_back(mp(x, y));
-    }
 }
 
 int main(){
-    freopen("input.txt", "r", stdin);
+    freopen("C101.txt", "r", stdin);
     freopen("output.txt", "w", stdout);
     input();
     init();
