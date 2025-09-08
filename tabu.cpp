@@ -37,6 +37,11 @@ vvi tabu_list; // for Tabu Search memory
 double best_cost; // best total travel time found
 vector<pair<double, int>> angle_customer; // (angle, customer index)
 vvi closest_neighbors; // closest_neighbors[i]: list of closest neighbors to customer i
+vvi freq; // freq[k][i]: how many times customer i inserted into route k for diversification
+
+const int MAX_ITER = 20000; // max iterations for Tabu Search
+const double lambda = 10.0; // scaling factor for frequency penalty (tune as needed)
+const int nmax = 500; // for early stopping if no improvement
 
 struct Solution {
     vvi routes; // routes for each vehicle
@@ -245,6 +250,7 @@ void print_solution(const Solution& sol) {
     }
     cout << endl;
     cout << "Total Cost: " << sol.total_cost << endl;
+    cout << endl;
 }
 
 
@@ -263,15 +269,8 @@ void compute_closest_neighbors(int p1) {
     }
 }
 
-// Randomly pick a customer, find suitable routes, evaluate all moves and return best neighbor
-Solution best_neighbor(const Solution& sol, double alpha, double beta, double gamma, double p1=0.2*n, double p2=0.2*n) {
-    // 1. Randomly pick a customer i (not depot)
-    random_device rd;
-    mt19937 gen(rd());
-    uniform_int_distribution<> dis(1, n);
-    int i = dis(gen);
-    int from_route = sol.customer_vehicle[i];
-    cout << "Considering moving customer " << i << " from route " << from_route << endl;
+// Randomly pick a customer, find suitable routes, evaluate all moves (considering tabu moves) and return best neighbor
+Solution best_neighbor(const Solution& sol, int i, int current_iter, int from_route, double alpha, double beta, double gamma, double p1, double p2, double best_f2=1e18, double best_cost=1e18) {
 
     // 2. Use precomputed closest neighbors
     set<int> close_neighbors(closest_neighbors[i].begin(), closest_neighbors[i].end());
@@ -290,12 +289,8 @@ Solution best_neighbor(const Solution& sol, double alpha, double beta, double ga
         if (empty || has_neighbor) suitable_routes.push_back(k);
     }
 
-    cout << "Suitable routes for insertion: ";
-    for (int k : suitable_routes) cout << k << " ";
-    cout << endl;
-
     // 4. For each suitable route, try all possible insertions
-    double best_cost = 1e18;
+    double best_neighbor_cost = 1e18;
     Solution best_sol = sol;
     // GENI algorithm: only consider insertions adjacent to P2 closest nodes in route k
     for (int k : suitable_routes) {
@@ -312,85 +307,72 @@ Solution best_neighbor(const Solution& sol, double alpha, double beta, double ga
         geni_positions.insert(1);
         geni_positions.insert((int)sol.routes[k].size() - 1);
         for (int pos : geni_positions) {
+            cout << "Trying to insert customer " << i << " into route " << k << " at position " << pos << endl;
             if (pos < 1 || pos >= (int)sol.routes[k].size()) continue;
             Solution cand = sol;
-            // Find position of i in from_route before removing
-            auto& r1 = cand.routes[from_route];
-            int pos_rm = -1;
-            for (int p = 1; p < (int)r1.size() - 1; ++p) {
-                if (r1[p] == i) { pos_rm = p; break; }
-            }
-            // Remove i from from_route
-            if (pos_rm != -1) r1.erase(r1.begin() + pos_rm);
-            cand.load[from_route] -= demand[i];
-            // Insert i into route k at pos
-            auto& r2 = cand.routes[k];
-            r2.insert(r2.begin() + pos, i);
-            cand.load[k] += demand[i];
-            // Incrementally update durations for from_route and k
-            // Now pos_rm is the position where i was in from_route before removal
-            // Update duration for from_route
-            double delta_from = 0.0;
-            if (pos_rm != -1) {
-                int prev = r1[pos_rm - 1];
-                int next = (pos_rm < (int)r1.size()) ? r1[pos_rm] : 0;
-                delta_from -= dist[prev][i] + di[i] + dist[i][next];
-                delta_from += dist[prev][next];
-            }
-            cand.duration[from_route] += delta_from;
-
-            // For k: i was inserted at pos
-            // We know where i was inserted: pos
-            double delta_k = 0.0;
-            {
-                int prev = r2[pos - 1];
-                int next = (pos < (int)r2.size() - 1) ? r2[pos + 1] : 0;
-                delta_k += dist[prev][i] + di[i] + dist[i][next];
-                delta_k -= dist[prev][next];
-            }
-            cand.duration[k] += delta_k;
-            // Efficiently update arrival times only from affected positions
-            // For from_route: update from pos_rm (first node after removed i)
-            for (int t : {from_route, k}) {
-                int start = 1;
-                if (t == from_route && pos_rm != -1) start = pos_rm;
-                if (t == k) start = pos; // pos is where i was inserted
-                // Set arrival time for node before start (if not already set)
-                if (start > 1 && cand.arrival_time[cand.routes[t][start-1]] == 0.0) {
-                    // Compute up to start-1
-                    double tt = 0.0;
-                    for (int p = 1; p < start; ++p) {
-                        int prev = cand.routes[t][p-1];
-                        int curr = cand.routes[t][p];
-                        tt += dist[prev][curr];
-                        if (curr != 0) {
-                            cand.arrival_time[curr] = max((double)ei[curr], tt);
-                            tt = cand.arrival_time[curr] + di[curr];
-                        }
-                    }
+            // Remove i from all routes to prevent duplication
+            for (int r = 1; r <= m; ++r) {
+                auto& route = cand.routes[r];
+                auto it = std::find(route.begin(), route.end(), i);
+                if (it != route.end()) {
+                    route.erase(it);
+                    cand.load[r] -= demand[i];
                 }
-                // Now update from start onward
-                double tt = cand.arrival_time[cand.routes[t][start-1]];
-                for (int p = start; p < (int)cand.routes[t].size(); ++p) {
-                    int prev = cand.routes[t][p-1];
-                    int curr = cand.routes[t][p];
-                    tt += dist[prev][curr];
-                    if (curr != 0) {
-                        cand.arrival_time[curr] = max((double)ei[curr], tt);
-                        tt = cand.arrival_time[curr] + di[curr];
-                    }
+            }
+            // Insert i into route k at pos (adjust pos if needed)
+            auto& r2 = cand.routes[k];
+            int insert_pos = pos;
+            // If i was before pos in r2, pos--
+            for (int p = 0; p < (int)r2.size() && p < pos; ++p) {
+                if (r2[p] == i) insert_pos--;
+            }
+            r2.insert(r2.begin() + insert_pos, i);
+            cand.load[k] += demand[i];
+            // Update duration for route k only (since i is only in k now)
+            double delta_k = 0.0;
+            int new_pos = insert_pos;
+            int prev = r2[new_pos - 1];
+            int next = (new_pos < (int)r2.size() - 1) ? r2[new_pos + 1] : 0;
+            delta_k += dist[prev][i] + di[i] + dist[i][next];
+            delta_k -= dist[prev][next];
+            cand.duration[k] += delta_k;
+            // Efficiently update arrival times for route k only
+            if (!cand.routes[k].empty()) cand.arrival_time[cand.routes[k][0]] = 0.0;
+            double tt = 0.0;
+            for (int p = 1; p < (int)cand.routes[k].size(); ++p) {
+                int prev = cand.routes[k][p-1];
+                int curr = cand.routes[k][p];
+                tt += dist[prev][curr];
+                if (curr != 0) {
+                    cand.arrival_time[curr] = max((double)ei[curr], tt);
+                    tt = cand.arrival_time[curr] + di[curr];
                 }
             }
             // Recompute total cost
-            cand.total_cost += delta_from + delta_k;
+            cand.total_cost = 0.0;
+            for (int r = 1; r <= m; ++r) cand.total_cost += cand.duration[r];
             // Update customer_vehicle
             cand.customer_vehicle[i] = k;
             // Evaluate penalized cost
             double f2 = F2(cand, alpha, beta, gamma);
+            // Tabu check: skip if tabu unless aspiration (improves best_cost)
+            bool is_tabu = (tabu_list[k][i] > current_iter);
+            if (is_tabu && (f2 >= best_f2 && f2 > cand.total_cost || cand.total_cost >= best_cost && f2 == cand.total_cost)){
+                cout << "Move is tabu, skipping." << endl;
+                continue;
+            }
+            // Frequency penalty for diversification (only for non-improving moves)
+            double penalized_f2 = 0.0;
+            if (f2 > best_f2){
+                for (int r = 1; r <= n; ++r) {
+                    penalized_f2 += freq[cand.customer_vehicle[r]][r];
+                }
+                penalized_f2 *= lambda * sqrt(n * m) * cand.total_cost;
+            }
             print_solution(cand);
-            cout << "F2: " << f2 << endl;
-            if (f2 < best_cost) {
-                best_cost = f2;
+            penalized_f2 = f2 + penalized_f2;
+            if (penalized_f2 < best_neighbor_cost) {
+                best_neighbor_cost = penalized_f2;
                 best_sol = cand;
             }
         }
@@ -398,64 +380,107 @@ Solution best_neighbor(const Solution& sol, double alpha, double beta, double ga
     return best_sol;
 }
 
-Solution tabu_search(Solution sol, double alpha, double beta, double gamma) {
+// Placeholder for TSP with Time Windows post-optimization (GENIUS adaptation)
+// This should be replaced with a real implementation for best results
+void post_optimize_route(vector<int>& route, vector<double>& arrival_time, int k) {
+    // TODO: Implement GENIUS or other TSPTW heuristic for a single route
+    // For now, this is a no-op (identity)
+    // route: route[k], arrival_time: arrival_time for route k, k: vehicle index
+}
+
+Solution tabu_search(Solution sol, double theta = 0.05, double p1=0.2*n, double p2=0.2*n) {
+    cout << "Starting Tabu Search with theta=" << theta << ", p1=" << p1 << ", p2=" << p2 << endl;
+    print_solution(sol);
     // Evaluate all possible moves: move customer i from route k to route k', insert at best position
+    double best_f2 = 1e18;
     double best_cost = 1e18;
     Solution best_sol = sol;
-    for (int k = 1; k <= m; ++k) {
-        for (int pos = 1; pos < (int)sol.routes[k].size() - 1; ++pos) { // skip depot at start/end
-            int cust = sol.routes[k][pos];
-            // Try removing cust from route k
-            for (int kp = 1; kp <= m; ++kp) {
-                if (k == kp && sol.routes[k].size() <= 3) continue; // can't remove last customer
-                for (int posp = 1; posp < (int)sol.routes[kp].size(); ++posp) { // insert after depot
-                    if (k == kp && (posp == pos || posp == pos+1)) continue; // skip no-op
-                    // Build new solution
-                    Solution cand = sol;
-                    // Remove cust from k
-                    cand.routes[k].erase(cand.routes[k].begin() + pos);
-                    cand.load[k] -= demand[cust];
-                    // Insert cust into kp at posp
-                    cand.routes[kp].insert(cand.routes[kp].begin() + posp, cust);
-                    cand.load[kp] += demand[cust];
-                    // Recompute durations for k and kp
-                    for (int t : {k, kp}) {
-                        cand.duration[t] = 0;
-                        for (int p = 1; p < (int)cand.routes[t].size(); ++p) {
-                            int prev = cand.routes[t][p-1];
-                            int curr = cand.routes[t][p];
-                            cand.duration[t] += dist[prev][curr];
-                            if (curr != 0) cand.duration[t] += di[curr];
-                        }
-                    }
-                    // Recompute arrival times for all customers in k and kp
-                    cand.arrival_time.assign(n+1, 0.0);
-                    for (int t : {k, kp}) {
-                        double tt = 0;
-                        for (int p = 1; p < (int)cand.routes[t].size(); ++p) {
-                            int prev = cand.routes[t][p-1];
-                            int curr = cand.routes[t][p];
-                            tt += dist[prev][curr];
-                            if (curr != 0) {
-                                cand.arrival_time[curr] = max((double)ei[curr], tt);
-                                tt = cand.arrival_time[curr] + di[curr];
-                            }
-                        }
-                    }
-                    // Recompute total cost
-                    cand.total_cost = 0;
-                    for (int t = 1; t <= m; ++t) cand.total_cost += cand.duration[t];
-                    // Update customer_vehicle
-                    cand.customer_vehicle[cust] = kp;
-                    // Evaluate penalized cost
-                    double f2 = F2(cand, alpha, beta, gamma);
-                    if (f2 < best_cost) {
-                        best_cost = f2;
-                        best_sol = cand;
-                    }
-                }
-            }
+    Solution current_sol = sol;
+    int current_iter = 0;
+    int tabu_min = 5, tabu_max = 10;
+    double alpha = 1.0, beta = 1.0, gamma = 1.0;
+    // Initialize frequency matrix
+    freq.assign(m+1, vector<int>(n+1, 0));
+    double current_f2 = F2(current_sol, alpha, beta, gamma);
+    if (current_f2 == current_sol.total_cost){
+        best_cost = current_sol.total_cost;
+    }
+    best_f2 = current_f2;
+    int no_improve_iters = 0;
+    double last_best_f2 = best_f2, last_best_cost = best_cost;
+    while (current_iter < MAX_ITER) {
+        random_device rd;
+        mt19937 gen(rd());
+        uniform_int_distribution<> dis(1, n);
+        int i = dis(gen);
+        int from_route = current_sol.customer_vehicle[i];
+        Solution neighbor = best_neighbor(current_sol, i, current_iter, from_route, alpha, beta, gamma, p1, p2, best_f2, best_cost);
+        double f2 = F2(neighbor, alpha, beta, gamma);
+        int to_route = neighbor.customer_vehicle[i];
+        // If the customer was actually moved to a new route, set tabu tenure
+        if (from_route != to_route) {
+            uniform_int_distribution<> tabu_dist(tabu_min, tabu_max);
+            int theta = tabu_dist(gen);
+            tabu_list[from_route][i] = current_iter + theta;
         }
+        // Update frequency for diversification
+        freq[to_route][i]++;
+        // update best solution found
+        if (f2 < best_f2 || (f2 == best_f2 && neighbor.total_cost < best_cost)) {
+            best_f2 = f2;
+            best_cost = neighbor.total_cost;
+            best_sol = neighbor;
+        }
+
+        // Early stopping: check if best_f2 and best_cost have improved
+        if (best_f2 < last_best_f2 || best_cost < last_best_cost) {
+            no_improve_iters = 0;
+            last_best_f2 = best_f2;
+            last_best_cost = best_cost;
+        } else {
+            no_improve_iters++;
+        }
+        if (no_improve_iters >= nmax) {
+            cout << "No improvement for " << nmax << " iterations. Stopping early." << endl;
+            break;
+        }
+
+        current_sol = neighbor;
+
+        // Adaptive penalty parameter update
+        // Check feasibility for each constraint
+        bool load_feas = true, dur_feas = true, tw_feas = true;
+        for (int k = 1; k <= m; ++k) {
+            if (current_sol.load[k] > Qk[k]) load_feas = false;
+            if (current_sol.duration[k] > Dk[k]) dur_feas = false;
+        }
+        for (int j = 1; j <= n; ++j) {
+            if (current_sol.arrival_time[j] > li[j]) tw_feas = false;
+        }
+        // Update alpha (load penalty)
+        if (load_feas) {
+            alpha /= (1.0 + theta);
+        } else {
+            alpha *= (1.0 + theta);
+        }
+        // Update beta (duration penalty)
+        if (dur_feas) {
+            beta /= (1.0 + theta);
+        } else {
+            beta *= (1.0 + theta);
+        }
+        // Update gamma (time window penalty)
+        if (tw_feas) {
+            gamma /= (1.0 + theta);
+        } else {
+            gamma *= (1.0 + theta);
+        }
+
+        ++current_iter;
+    }
+    // Post-optimization: apply TSPTW heuristic to each route of best_sol
+    for (int k = 1; k <= m; ++k) {
+        post_optimize_route(best_sol.routes[k], best_sol.arrival_time, k);
     }
     return best_sol;
 }
@@ -463,10 +488,6 @@ Solution tabu_search(Solution sol, double alpha, double beta, double gamma) {
 void init() {
     build_distance_matrix();
     compute_closest_neighbors(int(0.2 * n)); // p1 = 20% of n
-}
-
-void tabu_search(){
-
 }
 
 void output(){
@@ -487,10 +508,8 @@ void output(){
     }
     //Print the solution:
     print_solution(sol);
-    double alpha = 10.0, beta = 10.0, gamma = 10.0;
-    cout << "Initial penalized cost F2: " << F2(sol, alpha, beta, gamma) << endl;
-    Solution best_sol = best_neighbor(sol, alpha, beta, gamma, 0.3*n, 0.3*n);
-    cout << "Best neighbor solution:" << endl;
+    Solution step_1_sol = tabu_search(sol, 0.1, int(0.2*n), int(0.2*n));
+    Solution best_sol = tabu_search(step_1_sol, 0.05, int(0.1*n), int(0.1*n));
     print_solution(best_sol);
 }
 
@@ -528,6 +547,5 @@ int main(){
     freopen("output.txt", "w", stdout);
     input();
     init();
-    tabu_search();
     output();
 }
