@@ -429,7 +429,7 @@ Solution tabu_search(Solution sol, double delta = 0, double p1=0.2*n, double p2=
     Solution best_sol = sol;
     Solution current_sol = sol;
     int current_iter = 0;
-    int tabu_min = 5, tabu_max = 10;
+    int tabu_min = 10, tabu_max = 15;
     double alpha = 1, beta = 1, gamma = 1;
     // Initialize frequency matrix
     freq.assign(m+1, vector<int>(n+1, 0));
@@ -440,6 +440,7 @@ Solution tabu_search(Solution sol, double delta = 0, double p1=0.2*n, double p2=
     best_f2 = current_f2;
     int no_improve_iters = 0;
     double last_best_f2 = best_f2, last_best_cost = best_cost;
+    double prev_penalty_capacity = -1, prev_penalty_duration = -1, prev_penalty_time_window = -1;
 
     // Open file to log f2 and total_cost per iteration
     static int log_counter = 0;
@@ -466,9 +467,18 @@ Solution tabu_search(Solution sol, double delta = 0, double p1=0.2*n, double p2=
         }
         // print the best move found
         cout << "Iter " << current_iter << ": Move customer " << best_i << " from route " << best_from_route << " to route " << best_to_route << ", F2: " << best_neighbor_f2 << ", Cost: " << best_neighbor_sol.total_cost << endl;
-        // Print both penalized and unpenalized costs for clarity
+        // Print penalized and unpenalized costs for clarity
         double best_f2_val = F2(best_neighbor_sol, alpha, beta, gamma);
-        cout << "Best neighbor after moving customer " << best_i << ": penalized cost = " << best_neighbor_sol.total_cost
+        // Compute frequency penalty for this move
+        double freq_penalty = 0.0;
+        if (best_f2_val > best_f2) {
+            for (int r = 1; r <= n; ++r) {
+                freq_penalty += freq[best_neighbor_sol.customer_vehicle[r]][r];
+            }
+            freq_penalty *= lambda * sqrt(n * m) * best_neighbor_sol.total_cost;
+        }
+        double penalized_cost = best_f2_val + freq_penalty;
+        cout << "Best neighbor after moving customer " << best_i << ": penalized cost = " << penalized_cost
             << ", f2 = " << best_f2_val
             << ", total_cost = " << best_neighbor_sol.total_cost << endl;
         cout << "alpha: " << alpha << ", beta: " << beta << ", gamma: " << gamma << endl;
@@ -482,17 +492,59 @@ Solution tabu_search(Solution sol, double delta = 0, double p1=0.2*n, double p2=
         }
         // Update frequency for diversification
         if (best_i != -1) freq[best_to_route][best_i]++;
-        // update best solution found
-        if (best_neighbor_f2 < best_f2 || (best_neighbor_f2 == best_f2 && best_neighbor_sol.total_cost < best_cost)) {
-            best_f2 = best_neighbor_f2;
-            best_cost = best_neighbor_sol.total_cost;
-            best_sol = best_neighbor_sol;
+
+        // Adaptive penalty parameter update
+        // Check feasibility for each constraint
+        bool load_feas = true, dur_feas = true, tw_feas = true;
+        for (int k = 1; k <= m; ++k) {
+            if (current_sol.load[k] > Qk[k]) load_feas = false;
+            if (current_sol.duration[k] > Dk[k]) dur_feas = false;
+        }
+        for (int j = 1; j <= n; ++j) {
+            if (current_sol.arrival_time[j] > li[j]) tw_feas = false;
+        }
+        // Compute current penalties
+        double penalty_capacity = 0.0, penalty_duration = 0.0, penalty_time_window = 0.0;
+        for (int k = 1; k <= m; ++k) {
+            double Q = Qk[k];
+            double L = Dk[k];
+            penalty_capacity += max(0.0, (double)current_sol.load[k] - Q);
+            penalty_duration += max(0.0, current_sol.duration[k] - L);
+        }
+        for (int i = 1; i <= n; ++i) {
+            double at = current_sol.arrival_time[i];
+            if (at > li[i]) penalty_time_window += at - li[i];
         }
 
-        if (best_neighbor_f2 < current_f2 || (best_neighbor_f2 == current_f2 && best_neighbor_sol.total_cost < current_sol.total_cost)) {
-            current_sol = best_neighbor_sol;
-            current_f2 = best_neighbor_f2;
+        // Track previous penalties (static across iterations)
+        if (prev_penalty_capacity < 0) prev_penalty_capacity = penalty_capacity;
+        if (prev_penalty_duration < 0) prev_penalty_duration = penalty_duration;
+        if (prev_penalty_time_window < 0) prev_penalty_time_window = penalty_time_window;
+
+        // Dynamically update alpha, beta, gamma based on penalty change
+        double eps = 1e-8;
+        // Use max of previous and current penalty in denominator for stability
+        // Use tanh for smooth, bounded update
+        if (penalty_capacity > eps || prev_penalty_capacity > eps) {
+            double denom = max(penalty_capacity, prev_penalty_capacity) + eps;
+            double diff = penalty_capacity - prev_penalty_capacity;
+            alpha *= (1.0 + delta * tanh(diff / denom));
         }
+        if (penalty_duration > eps || prev_penalty_duration > eps) {
+            double denom = max(penalty_duration, prev_penalty_duration) + eps;
+            double diff = penalty_duration - prev_penalty_duration;
+            beta *= (1.0 + delta * tanh(diff / denom));
+        }
+        if (penalty_time_window > eps || prev_penalty_time_window > eps) {
+            double denom = max(penalty_time_window, prev_penalty_time_window) + eps;
+            double diff = penalty_time_window - prev_penalty_time_window;
+            gamma *= (1.0 + delta * tanh(diff / denom));
+        }
+
+        // Clamp penalty parameters to reasonable bounds
+        alpha = min(max(alpha, 1e-4), 1e6);
+        beta = min(max(beta, 1e-4), 1e6);
+        gamma = min(max(gamma, 1e-4), 1e6);
 
         // Early stopping: check if best_f2 and best_cost have improved
         if (best_f2 < last_best_f2 || best_cost < last_best_cost) {
@@ -506,33 +558,22 @@ Solution tabu_search(Solution sol, double delta = 0, double p1=0.2*n, double p2=
             break;
         }
 
-        // Adaptive penalty parameter update
-        // Check feasibility for each constraint
-        bool load_feas = true, dur_feas = true, tw_feas = true;
-        for (int k = 1; k <= m; ++k) {
-            if (current_sol.load[k] > Qk[k]) load_feas = false;
-            if (current_sol.duration[k] > Dk[k]) dur_feas = false;
+        // Update previous penalties for next iteration
+        prev_penalty_capacity = penalty_capacity;
+        prev_penalty_duration = penalty_duration;
+        prev_penalty_time_window = penalty_time_window;
+
+        // update best infeasible solution found
+        if (best_neighbor_f2 < best_f2 || (best_neighbor_f2 == best_f2 && best_neighbor_sol.total_cost < best_cost)) {
+            best_f2 = best_neighbor_f2;
+            best_sol = best_neighbor_sol;
+            best_cost = best_neighbor_sol.total_cost;
         }
-        for (int j = 1; j <= n; ++j) {
-            if (current_sol.arrival_time[j] > li[j]) tw_feas = false;
-        }
-        // Update alpha (load penalty)
-        if (load_feas) {
-            alpha /= (1.0 + delta);
-        } else {
-            alpha *= (1.0 + delta);
-        }
-        // Update beta (duration penalty)
-        if (dur_feas) {
-            beta /= (1.0 + delta);
-        } else {
-            beta *= (1.0 + delta);
-        }
-        // Update gamma (time window penalty)
-        if (tw_feas) {
-            gamma /= (1.0 + delta);
-        } else {
-            gamma *= (1.0 + delta);
+
+        // Move to best neighbor
+        if (best_neighbor_f2 < current_f2 || (best_neighbor_f2 == current_f2 && best_neighbor_sol.total_cost < current_sol.total_cost)) {
+            current_sol = best_neighbor_sol;
+            current_f2 = best_neighbor_f2;
         }
 
         // Log best_f2 and best_cost for this iteration
@@ -570,8 +611,8 @@ void output(){
     }
     //Print the solution:
     print_solution(sol);
-    Solution step_1_sol = tabu_search(sol, 0.003, int(0.2*n), int(0.2*n));
-    Solution best_sol = tabu_search(step_1_sol, 0.006, int(0.1*n), int(0.1*n));
+    Solution step_1_sol = tabu_search(sol, 0.1, int(0.2*n), int(0.2*n));
+    Solution best_sol = tabu_search(step_1_sol, 0.2, int(0.1*n), int(0.1*n));
     print_solution(best_sol);
 }
 
@@ -639,7 +680,7 @@ void input(){
 }
 
 int main(){
-    freopen("C101.txt", "r", stdin);
+    freopen("R101.txt", "r", stdin);
     freopen("output.txt", "w", stdout);
     input();
     init();
